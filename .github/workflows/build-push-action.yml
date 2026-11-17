@@ -1,0 +1,170 @@
+name: Docker Build & Push Action
+
+# This workflow is intended to be called from other workflows using `workflow_call`.
+# It builds multi arch Docker images for the upstream repository (or any other
+# repo that provides a compatible Dockerfile) and pushes them to Docker Hub.
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Docker Hub image name (including namespace)"
+        required: true
+        type: string
+      upstream_repo:
+        description: "GitHub repository to checkout (owner/repo)"
+        required: true
+        type: string
+      dockerfile_path:
+        description: "Path to Dockerfile"
+        required: false
+        default: "."
+        type: string
+      context_path:
+        description: "Docker build context path"
+        required: false
+        default: "."
+        type: string
+    secrets:
+      dockerhub_token:
+        description: "Docker Hub access token"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  prepare:
+    name: Get latest upstream release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.TAG }}
+    steps:
+      - name: Get latest release tag from upstream
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.upstream_repo }}"
+          TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | jq -er '.tag_name')
+          echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Using upstream tag: ${TAG}"
+
+  build:
+    name: Build (${{ matrix.architecture }})
+    runs-on: ubuntu-latest
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [amd64, arm64]
+    steps:
+      - name: Checkout upstream source at tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.upstream_repo }}
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Build and push per‑arch image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context_path }}
+          file: ${{ inputs.dockerfile_path }}
+          platforms: linux/${{ matrix.architecture }}
+          push: true
+          tags: ${{ inputs.image_name }}:build-${{ matrix.architecture }}
+          cache-from: type=gha,scope=build-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.architecture }}
+          provenance: true
+          sbom: true
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${DIGEST#sha256:}"
+          if [[ ! "$digest" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::Invalid image digest: ${DIGEST}"
+            exit 1
+          fi
+          echo -n "$digest" > "${{ runner.temp }}/digests/$digest"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-linux-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge multi arch manifest
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    steps:
+      - name: Download all digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Create and push multi‑arch manifest
+        env:
+          VERSION: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${{ runner.temp }}/digests"
+          shopt -s nullglob
+          digests=(*)
+          if [[ ${#digests[@]} -ne 2 ]]; then
+            echo "::error::Expected 2 image digests, found ${#digests[@]}"
+            ls -la
+            exit 1
+          fi
+          images=()
+          for digest in "${digests[@]}"; do
+            if [[ ! "$digest" =~ ^[a-f0-9]{64}$ ]]; then
+              echo "::error::Invalid digest filename: $digest"
+              exit 1
+            fi
+            images+=("${{ inputs.image_name }}@sha256:${digest}")
+          done
+          echo "Creating manifest for ${{ inputs.image_name }}:${VERSION}"
+          docker buildx imagetools create \
+            --tag "${{ inputs.image_name }}:latest" \
+            --tag "${{ inputs.image_name }}:${VERSION}" \
+            "${images[@]}"
+
+      - name: Inspect resulting image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${{ inputs.image_name }}:latest"
