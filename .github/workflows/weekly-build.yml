@@ -1,0 +1,26 @@
+name: Weekly Docker Build & Push
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  call-build-push:
+    name: Build & push step-ca image
+    uses: ./.github/workflows/build-push-action.yml
+    with:
+      image_name: "your-dockerhub-username/step-ca"
+      username: "your-dockerhub-username"
+      upstream_repo: "smallstep/step-ca"
+      registry: "docker.io"
+      dockerfile_path: "."
+      context_path: "."
+    secrets:
+      registry_token: ${{ secrets.REGISTRY_TOKEN }}
